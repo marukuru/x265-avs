@@ -32,56 +32,6 @@ if( cond )\
 
 using namespace X265_NS;
 
-
-lib_path_t AVSInput::convertLibraryPath(std::string path)
-{
-#if defined(_WIN32_WINNT)
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &path[0], (int)path.size(), NULL, 0);
-    std::wstring wstrTo( size_needed, 0 );
-    MultiByteToWideChar(CP_UTF8, 0, &path[0], (int)path.size(), &wstrTo[0], size_needed);
-    return wstrTo;
-#else
-    return path;
-#endif
-}
-
-void AVSInput::parseAvsOptions(const char* _options)
-{
-    std::string options {_options}; options += ";";
-    std::string optSeparator {";"};
-    std::string valSeparator {"="};
-    std::map<std::string, int> knownOptions {
-        {std::string {"library"}, 1}
-    };
-
-    auto start = 0U;
-    auto end = options.find(optSeparator);
-
-    while ((end = options.find(optSeparator, start)) != std::string::npos)
-    {
-        auto option = options.substr(start, end - start);
-        auto valuePos = option.find(valSeparator);
-        if (valuePos != std::string::npos)
-        {
-            auto key = option.substr(0U, valuePos);
-            auto value = option.substr(valuePos + 1, option.length());
-            switch (knownOptions[key])
-            {
-            case 1:
-                avs_library_path = convertLibraryPath(value);
-                general_log(nullptr, "avs+", X265_LOG_INFO, "using external Avisynth library from %s\n", value.c_str());
-                break;
-            }
-        }
-        else if (option.length() > 0)
-        {
-            general_log(nullptr, "avs+", X265_LOG_ERROR, "invalid option \"%s\" ignored\n", option.c_str());
-        }
-        start = end + optSeparator.length();
-        end = options.find(optSeparator, start);
-    }
-}
-
 void AVSInput::load_avs()
 {
     avs_open();
@@ -127,7 +77,12 @@ void AVSInput::info_avs()
 
 void AVSInput::openfile(InputFileInfo& info)
 {
-    AVS_Value res = h->func.avs_invoke(h->env, "Import", avs_new_value_string(info.filename), NULL);
+#ifdef _WIN32
+    wchar_t filename_wc[BUFFER_SIZE * 4];
+    MultiByteToWideChar(CP_UTF8, 0, real_filename, -1, filename_wc, BUFFER_SIZE);
+    WideCharToMultiByte(CP_THREAD_ACP, 0, filename_wc, -1, real_filename, BUFFER_SIZE, NULL, NULL);
+#endif
+    AVS_Value res = h->func.avs_invoke(h->env, "Import", avs_new_value_string(real_filename), NULL);
     FAIL_IF_ERROR(avs_is_error(res), "Error loading file: %s\n", avs_as_string(res));
     FAIL_IF_ERROR(!avs_is_clip(res), "File didn't return a video clip\n");
     h->clip = h->func.avs_take_clip(res, h->env);
@@ -143,23 +98,31 @@ void AVSInput::openfile(InputFileInfo& info)
     {
         h->plane_count = 1;
         info.csp = X265_CSP_I400;
+        general_log(NULL, "avs+", X265_LOG_INFO, "Video colorspace: YUV400 (Y8)\n");
     }
     else if(h->func.avs_is_420(vi))
     {
         info.csp = X265_CSP_I420;
+        general_log(NULL, "avs+", X265_LOG_INFO, "Video colorspace: YUV420 (YV12)\n");
     }
     else if(h->func.avs_is_422(vi))
     {
         info.csp = X265_CSP_I422;
+        general_log(NULL, "avs+", X265_LOG_INFO, "Video colorspace: YUV422 (YV16)\n");
     }
     else if(h->func.avs_is_444(vi))
     {
         info.csp = X265_CSP_I444;
+        general_log(NULL, "avs+", X265_LOG_INFO, "Video colorspace: YUV444 (YV24)\n");
     }
     else
     {
         FAIL_IF_ERROR(1, "Video colorspace is not supported\n");
     }
+    general_log(NULL, "avs+", X265_LOG_INFO, "Video depth: %d\n", info.depth);
+    general_log(NULL, "avs+", X265_LOG_INFO, "Video resolution: %dx%d\n", info.width, info.height);
+    general_log(NULL, "avs+", X265_LOG_INFO, "Video framerate: %d/%d\n", info.fpsNum, info.fpsDenom);
+    general_log(NULL, "avs+", X265_LOG_INFO, "Video framecount: %d\n", info.frameCount);
     if (info.skipFrames)
         h->next_frame = info.skipFrames;
 }
