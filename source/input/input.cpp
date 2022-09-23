@@ -24,6 +24,9 @@
 #include "input.h"
 #include "yuv.h"
 #include "y4m.h"
+#ifdef HAVE_AVS
+#include "avs.h"
+#endif
 
 using namespace X265_NS;
 
@@ -33,6 +36,10 @@ InputFile* InputFile::open(InputFileInfo& info, bool bForceY4m)
 
     if (bForceY4m || (s && !strcmp(s, ".y4m")))
         return new Y4MInput(info);
+#ifdef HAVE_AVS
+    else if (s && !strcmp(s, ".avs"))
+        return new AVSInput(info);
+#endif
     else
         return new YUVInput(info);
 }
