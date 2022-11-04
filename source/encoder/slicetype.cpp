@@ -45,6 +45,14 @@ using namespace X265_NS;
 
 namespace {
 
+uint32_t acEnergyVarHist(uint64_t sum_ssd, int shift)
+{
+    uint32_t sum = (uint32_t)sum_ssd;
+    uint32_t ssd = (uint32_t)(sum_ssd >> 32);
+
+    return ssd - ((uint64_t)sum * sum >> shift);
+}
+
 /* Compute variance to derive AC energy of each block */
 inline uint32_t acEnergyVar(Frame *curFrame, uint64_t sum_ssd, int shift, int plane)
 {
@@ -519,7 +527,7 @@ void LookaheadTLD::calcAdaptiveQuantFrame(Frame *curFrame, x265_param* param)
                 if (curFrame->m_frameSegment == X265_AQ_EDGE )
                     edgeFilter(curFrame, param);
 
-                if (curFrame->m_frameSegment == X265_AQ_EDGE  && !param->bHistBasedSceneCut && param->recursionSkipMode == EDGE_BASED_RSKIP)
+                if (curFrame->m_frameSegment == X265_AQ_EDGE && param->recursionSkipMode == EDGE_BASED_RSKIP)
                 {
                     pixel* src = curFrame->m_edgePic + curFrame->m_fencPic->m_lumaMarginY * curFrame->m_fencPic->m_stride + curFrame->m_fencPic->m_lumaMarginX;
                     primitives.planecopy_pp_shr(src, curFrame->m_fencPic->m_stride, curFrame->m_edgeBitPic,
@@ -1050,7 +1058,30 @@ Lookahead::Lookahead(x265_param *param, ThreadPool* pool)
     m_countPreLookahead = 0;
 #endif
 
-    memset(m_histogram, 0, sizeof(m_histogram));
+    m_accHistDiffRunningAvgCb = X265_MALLOC(uint32_t*, NUMBER_OF_SEGMENTS_IN_WIDTH * sizeof(uint32_t*));
+    m_accHistDiffRunningAvgCb[0] = X265_MALLOC(uint32_t, NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT);
+    memset(m_accHistDiffRunningAvgCb[0], 0, sizeof(uint32_t) * NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT);
+    for (uint32_t w = 1; w < NUMBER_OF_SEGMENTS_IN_WIDTH; w++) {
+        m_accHistDiffRunningAvgCb[w] = m_accHistDiffRunningAvgCb[0] + w * NUMBER_OF_SEGMENTS_IN_HEIGHT;
+    }
+
+    m_accHistDiffRunningAvgCr = X265_MALLOC(uint32_t*, NUMBER_OF_SEGMENTS_IN_WIDTH * sizeof(uint32_t*));
+    m_accHistDiffRunningAvgCr[0] = X265_MALLOC(uint32_t, NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT);
+    memset(m_accHistDiffRunningAvgCr[0], 0, sizeof(uint32_t) * NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT);
+    for (uint32_t w = 1; w < NUMBER_OF_SEGMENTS_IN_WIDTH; w++) {
+        m_accHistDiffRunningAvgCr[w] = m_accHistDiffRunningAvgCr[0] + w * NUMBER_OF_SEGMENTS_IN_HEIGHT;
+    }
+
+    m_accHistDiffRunningAvg = X265_MALLOC(uint32_t*, NUMBER_OF_SEGMENTS_IN_WIDTH * sizeof(uint32_t*));
+    m_accHistDiffRunningAvg[0] = X265_MALLOC(uint32_t, NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT);
+    memset(m_accHistDiffRunningAvg[0], 0, sizeof(uint32_t) * NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT);
+    for (uint32_t w = 1; w < NUMBER_OF_SEGMENTS_IN_WIDTH; w++) {
+        m_accHistDiffRunningAvg[w] = m_accHistDiffRunningAvg[0] + w * NUMBER_OF_SEGMENTS_IN_HEIGHT;
+    }
+
+    m_resetRunningAvg = true;
+
+    m_segmentCountThreshold = (uint32_t)(((float)((NUMBER_OF_SEGMENTS_IN_WIDTH * NUMBER_OF_SEGMENTS_IN_HEIGHT) * 50) / 100) + 0.5);
 }
 
 #if DETAILED_CU_STATS
@@ -1098,6 +1129,7 @@ void Lookahead::stopJobs()
             m_pool[i].stopWorkers();
     }
 }
+
 void Lookahead::destroy()
 {
     // these two queues will be empty unless the encode was aborted
@@ -1415,6 +1447,290 @@ double computeEdgeIntensity(pixel *inPlane, int width, int height, intptr_t stri
     return (count / (width * height)) * 100;
 }
 
+uint32_t LookaheadTLD::calcVariance(pixel* inpSrc, intptr_t stride, intptr_t blockOffset, uint32_t plane)
+{
+    pixel* src = inpSrc + blockOffset;
+
+    uint32_t var;
+    if (!plane)
+        var = acEnergyVarHist(primitives.cu[BLOCK_8x8].var(src, stride), 6);
+    else
+        var = acEnergyVarHist(primitives.cu[BLOCK_4x4].var(src, stride), 4);
+
+    x265_emms();
+    return var;
+}
+
+/*
+** Compute Block and Picture Variance, Block Mean for all blocks in the picture
+*/
+void LookaheadTLD::computePictureStatistics(Frame *curFrame)
+{
+    int maxCol = curFrame->m_fencPic->m_picWidth;
+    int maxRow = curFrame->m_fencPic->m_picHeight;
+    intptr_t inpStride = curFrame->m_fencPic->m_stride;
+
+    // Variance
+    uint64_t picTotVariance = 0;
+    uint32_t variance;
+
+    uint64_t blockXY = 0;
+    pixel* src = curFrame->m_fencPic->m_picOrg[0];
+
+    for (int blockY = 0; blockY < maxRow; blockY += 8)
+    {
+        uint64_t rowVariance = 0;
+        for (int blockX = 0; blockX < maxCol; blockX += 8)
+        {
+            intptr_t blockOffsetLuma = blockX + (blockY * inpStride);
+
+            variance = calcVariance(
+                src,
+                inpStride,
+                blockOffsetLuma, 0);
+
+            rowVariance += variance;
+            blockXY++;
+        }
+        picTotVariance += (uint16_t)(rowVariance / maxCol);
+    }
+
+    curFrame->m_lowres.picAvgVariance = (uint16_t)(picTotVariance / maxRow);
+
+    // Collect chroma variance
+    int hShift = curFrame->m_fencPic->m_hChromaShift;
+    int vShift = curFrame->m_fencPic->m_vChromaShift;
+
+    int maxColChroma = curFrame->m_fencPic->m_picWidth >> hShift;
+    int maxRowChroma = curFrame->m_fencPic->m_picHeight >> vShift;
+    intptr_t cStride = curFrame->m_fencPic->m_strideC;
+
+    pixel* srcCb = curFrame->m_fencPic->m_picOrg[1];
+
+    picTotVariance = 0;
+    for (int blockY = 0; blockY < maxRowChroma; blockY += 4)
+    {
+        uint64_t rowVariance = 0;
+        for (int blockX = 0; blockX < maxColChroma; blockX += 4)
+        {
+            intptr_t blockOffsetChroma = blockX + blockY * cStride;
+
+            variance = calcVariance(
+                srcCb,
+                cStride,
+                blockOffsetChroma, 1);
+
+            rowVariance += variance;
+            blockXY++;
+        }
+        picTotVariance += (uint16_t)(rowVariance / maxColChroma);
+    }
+
+    curFrame->m_lowres.picAvgVarianceCb = (uint16_t)(picTotVariance / maxRowChroma);
+
+
+    pixel* srcCr = curFrame->m_fencPic->m_picOrg[2];
+
+    picTotVariance = 0;
+    for (int blockY = 0; blockY < maxRowChroma; blockY += 4)
+    {
+        uint64_t rowVariance = 0;
+        for (int blockX = 0; blockX < maxColChroma; blockX += 4)
+        {
+            intptr_t blockOffsetChroma = blockX + blockY * cStride;
+
+            variance = calcVariance(
+                srcCr,
+                cStride,
+                blockOffsetChroma, 2);
+
+            rowVariance += variance;
+            blockXY++;
+        }
+        picTotVariance += (uint16_t)(rowVariance / maxColChroma);
+    }
+
+    curFrame->m_lowres.picAvgVarianceCr = (uint16_t)(picTotVariance / maxRowChroma);
+}
+
+/*
+* Compute histogram of n-bins for the input
+*/
+void LookaheadTLD::calculateHistogram(
+    pixel     *inputSrc,
+    uint32_t   inputWidth,
+    uint32_t   inputHeight,
+    intptr_t   stride,
+    uint8_t    dsFactor,
+    uint32_t  *histogram,
+    uint64_t  *sum)
+
+{
+    *sum = 0;
+
+    for (uint32_t verticalIdx = 0; verticalIdx < inputHeight; verticalIdx += dsFactor)
+    {
+        for (uint32_t horizontalIdx = 0; horizontalIdx < inputWidth; horizontalIdx += dsFactor)
+        {
+            ++(histogram[inputSrc[horizontalIdx]]);
+            *sum += inputSrc[horizontalIdx];
+        }
+        inputSrc += (stride << (dsFactor >> 1));
+    }
+
+    return;
+}
+
+/*
+* Compute histogram bins and chroma pixel intensity *
+*/
+void LookaheadTLD::computeIntensityHistogramBinsChroma(
+    Frame    *curFrame,
+    uint64_t *sumAverageIntensityCb,
+    uint64_t *sumAverageIntensityCr)
+{
+    uint64_t    sum;
+    uint8_t     dsFactor = 4;
+
+    uint32_t segmentWidth = curFrame->m_lowres.widthFullRes / NUMBER_OF_SEGMENTS_IN_WIDTH;
+    uint32_t segmentHeight = curFrame->m_lowres.heightFullRes / NUMBER_OF_SEGMENTS_IN_HEIGHT;
+
+    for (uint32_t segmentInFrameWidthIndex = 0; segmentInFrameWidthIndex < NUMBER_OF_SEGMENTS_IN_WIDTH; segmentInFrameWidthIndex++)
+    {
+        for (uint32_t segmentInFrameHeightIndex = 0; segmentInFrameHeightIndex < NUMBER_OF_SEGMENTS_IN_HEIGHT; segmentInFrameHeightIndex++)
+        {
+            // Initialize bins to 1
+            for (uint32_t cuIndex = 0; cuIndex < 256; cuIndex++) {
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1][cuIndex] = 1;
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2][cuIndex] = 1;
+            }
+
+            uint32_t segmentWidthOffset = (segmentInFrameWidthIndex == NUMBER_OF_SEGMENTS_IN_WIDTH - 1) ?
+                curFrame->m_lowres.widthFullRes - (NUMBER_OF_SEGMENTS_IN_WIDTH * segmentWidth) : 0;
+
+            uint32_t segmentHeightOffset = (segmentInFrameHeightIndex == NUMBER_OF_SEGMENTS_IN_HEIGHT - 1) ?
+                curFrame->m_lowres.heightFullRes - (NUMBER_OF_SEGMENTS_IN_HEIGHT * segmentHeight) : 0;
+
+
+            // U Histogram
+            calculateHistogram(
+                curFrame->m_fencPic->m_picOrg[1] + ((segmentInFrameWidthIndex * segmentWidth) >> 1) + (((segmentInFrameHeightIndex * segmentHeight) >> 1) * curFrame->m_fencPic->m_strideC),
+                (segmentWidth + segmentWidthOffset) >> 1,
+                (segmentHeight + segmentHeightOffset) >> 1,
+                curFrame->m_fencPic->m_strideC,
+                dsFactor,
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1],
+                &sum);
+
+            sum = (sum << dsFactor);
+            *sumAverageIntensityCb += sum;
+            curFrame->m_lowres.averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1] =
+                (uint8_t)((sum + (((segmentWidth + segmentWidthOffset) * (segmentHeight + segmentHeightOffset)) >> 3)) / (((segmentWidth + segmentWidthOffset) * (segmentHeight + segmentHeightOffset)) >> 2));
+
+            for (uint16_t histogramBin = 0; histogramBin < HISTOGRAM_NUMBER_OF_BINS; histogramBin++) {
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1][histogramBin] =
+                    curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1][histogramBin] << dsFactor;
+            }
+
+            // V Histogram
+            calculateHistogram(
+                curFrame->m_fencPic->m_picOrg[2] + ((segmentInFrameWidthIndex * segmentWidth) >> 1) + (((segmentInFrameHeightIndex * segmentHeight) >> 1) * curFrame->m_fencPic->m_strideC),
+                (segmentWidth + segmentWidthOffset) >> 1,
+                (segmentHeight + segmentHeightOffset) >> 1,
+                curFrame->m_fencPic->m_strideC,
+                dsFactor,
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2],
+                &sum);
+
+            sum = (sum << dsFactor);
+            *sumAverageIntensityCr += sum;
+            curFrame->m_lowres.averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2] =
+                (uint8_t)((sum + (((segmentWidth + segmentWidthOffset) * (segmentHeight + segmentHeightOffset)) >> 3)) / (((segmentWidth + segmentHeightOffset) * (segmentHeight + segmentHeightOffset)) >> 2));
+
+            for (uint16_t histogramBin = 0; histogramBin < HISTOGRAM_NUMBER_OF_BINS; histogramBin++) {
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2][histogramBin] =
+                    curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2][histogramBin] << dsFactor;
+            }
+        }
+    }
+    return;
+
+}
+
+/*
+* Compute histogram bins and luma pixel intensity *
+*/
+void LookaheadTLD::computeIntensityHistogramBinsLuma(
+    Frame    *curFrame,
+    uint64_t *sumAvgIntensityTotalSegmentsLuma)
+{
+    uint64_t sum;
+
+    uint32_t segmentWidth = curFrame->m_lowres.quarterSampleLowResWidth / NUMBER_OF_SEGMENTS_IN_WIDTH;
+    uint32_t segmentHeight = curFrame->m_lowres.quarterSampleLowResHeight / NUMBER_OF_SEGMENTS_IN_HEIGHT;
+
+    for (uint32_t segmentInFrameWidthIndex = 0; segmentInFrameWidthIndex < NUMBER_OF_SEGMENTS_IN_WIDTH; segmentInFrameWidthIndex++)
+    {
+        for (uint32_t segmentInFrameHeightIndex = 0; segmentInFrameHeightIndex < NUMBER_OF_SEGMENTS_IN_HEIGHT; segmentInFrameHeightIndex++)
+        {
+            // Initialize bins to 1
+            for (uint32_t cuIndex = 0; cuIndex < 256; cuIndex++) {
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0][cuIndex] = 1;
+            }
+
+            uint32_t segmentWidthOffset = (segmentInFrameWidthIndex == NUMBER_OF_SEGMENTS_IN_WIDTH - 1) ?
+                curFrame->m_lowres.quarterSampleLowResWidth - (NUMBER_OF_SEGMENTS_IN_WIDTH * segmentWidth) : 0;
+
+            uint32_t segmentHeightOffset = (segmentInFrameHeightIndex == NUMBER_OF_SEGMENTS_IN_HEIGHT - 1) ?
+                curFrame->m_lowres.quarterSampleLowResHeight - (NUMBER_OF_SEGMENTS_IN_HEIGHT * segmentHeight) : 0;
+
+            // Y Histogram
+            calculateHistogram(
+                curFrame->m_lowres.quarterSampleLowResBuffer + (curFrame->m_lowres.quarterSampleLowResOriginX + segmentInFrameWidthIndex * segmentWidth) + ((curFrame->m_lowres.quarterSampleLowResOriginY + segmentInFrameHeightIndex * segmentHeight) * curFrame->m_lowres.quarterSampleLowResStrideY),
+                segmentWidth + segmentWidthOffset,
+                segmentHeight + segmentHeightOffset,
+                curFrame->m_lowres.quarterSampleLowResStrideY,
+                1,
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0],
+                &sum);
+
+            curFrame->m_lowres.averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0] = (uint8_t)((sum + (((segmentWidth + segmentWidthOffset)*(segmentWidth + segmentHeightOffset)) >> 1)) / ((segmentWidth + segmentWidthOffset)*(segmentHeight + segmentHeightOffset)));
+            (*sumAvgIntensityTotalSegmentsLuma) += (sum << 4);
+            for (uint32_t histogramBin = 0; histogramBin < HISTOGRAM_NUMBER_OF_BINS; histogramBin++)
+            {
+                curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0][histogramBin] =
+                    curFrame->m_lowres.picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0][histogramBin] << 4;
+            }
+        }
+    }
+}
+
+void LookaheadTLD::collectPictureStatistics(Frame *curFrame)
+{
+
+    uint64_t sumAverageIntensityCb = 0;
+    uint64_t sumAverageIntensityCr = 0;
+    uint64_t sumAverageIntensity = 0;
+
+    // Histogram bins for Luma
+    computeIntensityHistogramBinsLuma(
+        curFrame,
+        &sumAverageIntensity);
+
+    // Histogram bins for Chroma
+    computeIntensityHistogramBinsChroma(
+        curFrame,
+        &sumAverageIntensityCb,
+        &sumAverageIntensityCr);
+
+    curFrame->m_lowres.averageIntensity[0] = (uint8_t)((sumAverageIntensity + ((curFrame->m_lowres.widthFullRes * curFrame->m_lowres.heightFullRes) >> 1)) / (curFrame->m_lowres.widthFullRes * curFrame->m_lowres.heightFullRes));
+    curFrame->m_lowres.averageIntensity[1] = (uint8_t)((sumAverageIntensityCb + ((curFrame->m_lowres.widthFullRes * curFrame->m_lowres.heightFullRes) >> 3)) / ((curFrame->m_lowres.widthFullRes * curFrame->m_lowres.heightFullRes) >> 2));
+    curFrame->m_lowres.averageIntensity[2] = (uint8_t)((sumAverageIntensityCr + ((curFrame->m_lowres.widthFullRes * curFrame->m_lowres.heightFullRes) >> 3)) / ((curFrame->m_lowres.widthFullRes * curFrame->m_lowres.heightFullRes) >> 2));
+
+    computePictureStatistics(curFrame);
+
+    curFrame->m_lowres.bHistScenecutAnalyzed = false;
+}
 
 void PreLookaheadGroup::processTasks(int workerThreadID)
 {
@@ -1462,6 +1778,10 @@ void PreLookaheadGroup::processTasks(int workerThreadID)
 
         if (m_lookahead.m_bAdaptiveQuant)
             tld.calcAdaptiveQuantFrame(preFrame, m_lookahead.m_param);
+
+        if (m_lookahead.m_param->bHistBasedSceneCut)
+            tld.collectPictureStatistics(preFrame);
+
         tld.lowresIntraEstimate(preFrame->m_lowres, m_lookahead.m_param->rc.qgSize);
         preFrame->m_lowresInit = true;
 
@@ -1571,7 +1891,7 @@ void Lookahead::slicetypeDecide()
          m_param->rc.cuTree || m_param->scenecutThreshold || m_param->bHistBasedSceneCut ||
          (m_param->lookaheadDepth && m_param->rc.vbvBufferSize)))
     {
-        if(!m_param->rc.bStatRead)
+        if (!m_param->rc.bStatRead)
             slicetypeAnalyse(frames, false);
         bool bIsVbv = m_param->rc.vbvBufferSize > 0 && m_param->rc.vbvMaxBitrate > 0;
         if ((m_param->analysisLoad && m_param->scaleFactor && bIsVbv) || m_param->bliveVBV2pass)
@@ -1652,12 +1972,9 @@ void Lookahead::slicetypeDecide()
             }
             if (frm.sliceType == X265_TYPE_IDR && frm.bScenecut && isClosedGopRadl)
             {
-                if (!m_param->bHistBasedSceneCut || (m_param->bHistBasedSceneCut && frm.m_bIsHardScenecut))
-                {
-                    for (int i = bframes; i < bframes + m_param->radl; i++)
-                        list[i]->m_lowres.sliceType = X265_TYPE_B;
-                    list[(bframes + m_param->radl)]->m_lowres.sliceType = X265_TYPE_IDR;
-                }
+                for (int i = bframes; i < bframes + m_param->radl; i++)
+                    list[i]->m_lowres.sliceType = X265_TYPE_B;
+                list[(bframes + m_param->radl)]->m_lowres.sliceType = X265_TYPE_IDR;
             }
             if (frm.sliceType == X265_TYPE_IDR)
             {
@@ -1722,7 +2039,6 @@ void Lookahead::slicetypeDecide()
         list[bframes - 1]->m_lowres.bLastMiniGopBFrame = true;
     list[bframes]->m_lowres.leadingBframes = bframes;
     m_lastNonB = &list[bframes]->m_lowres;
-    m_histogram[bframes]++;
 
     /* insert a bref into the sequence */
     if (m_param->bBPyramid && bframes > 1 && !brefs)
@@ -2082,46 +2398,13 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
     int numAnalyzed = numFrames;
     bool isScenecut = false;
 
-    /* Temporal computations for scenecut detection */
-    if (m_param->bHistBasedSceneCut && m_param->bEnableTradScdInHscd)
-    {
-        for (int i = numFrames - 1; i > 0; i--)
-        {
-            if (frames[i]->interPCostPercDiff > 0.0)
-                continue;
-            int64_t interCost = frames[i]->costEst[1][0];
-            int64_t intraCost = frames[i]->costEst[0][0];
-            if (interCost < 0 || intraCost < 0)
-                continue;
-            int times = 0;
-            double averagePcost = 0.0, averageIcost = 0.0;
-            for (int j = i - 1; j >= 0 && times < 5; j--, times++)
-            {
-                if (frames[j]->costEst[0][0] > 0 && frames[j]->costEst[1][0] > 0)
-                {
-                    averageIcost += frames[j]->costEst[0][0];
-                    averagePcost += frames[j]->costEst[1][0];
-                }
-                else
-                    times--;
-            }
-            if (times)
-            {
-                averageIcost = averageIcost / times;
-                averagePcost = averagePcost / times;
-                frames[i]->interPCostPercDiff = abs(interCost - averagePcost) / X265_MIN(interCost, averagePcost) * 100;
-                frames[i]->intraCostPercDiff = abs(intraCost - averageIcost) / X265_MIN(intraCost, averageIcost) * 100;
-            }
-        }
-    }
+    if (m_param->bHistBasedSceneCut)
+        isScenecut = histBasedScenecut(frames, 0, 1, origNumFrames);
+    else
+        isScenecut = scenecut(frames, 0, 1, true, origNumFrames);
 
     /* When scenecut threshold is set, use scenecut detection for I frame placements */
-    if (!m_param->bHistBasedSceneCut || (m_param->bHistBasedSceneCut && m_param->bEnableTradScdInHscd && frames[1]->bScenecut))
-        isScenecut = scenecut(frames, 0, 1, true, origNumFrames);
-    else if (m_param->bHistBasedSceneCut && frames[1]->bScenecut)
-        isScenecut = true;
-
-    if (isScenecut && (m_param->bHistBasedSceneCut || m_param->scenecutThreshold))
+    if (m_param->scenecutThreshold && isScenecut)
     {
         frames[1]->sliceType = X265_TYPE_I;
         return;
@@ -2132,17 +2415,13 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
         m_extendGopBoundary = false;
         for (int i = m_param->bframes + 1; i < origNumFrames; i += m_param->bframes + 1)
         {
-            if (!m_param->bHistBasedSceneCut || (m_param->bHistBasedSceneCut && m_param->bEnableTradScdInHscd && frames[i + 1]->bScenecut))
-                scenecut(frames, i, i + 1, true, origNumFrames);
+            scenecut(frames, i, i + 1, true, origNumFrames);
 
             for (int j = i + 1; j <= X265_MIN(i + m_param->bframes + 1, origNumFrames); j++)
             {
-                if (frames[j]->bScenecut)
+                if (frames[j]->bScenecut && scenecutInternal(frames, j - 1, j, true))
                 {
-                    if (m_param->bEnableTradScdInHscd)
-                        m_extendGopBoundary = scenecutInternal(frames, j - 1, j, true);
-                    else
-                        m_extendGopBoundary = true;
+                    m_extendGopBoundary = true;
                     break;
                 }
             }
@@ -2249,10 +2528,8 @@ void Lookahead::slicetypeAnalyse(Lowres **frames, bool bKeyframe)
         {
             for (int j = 1; j < numBFrames + 1; j++)
             {
-                bool isNextScenecut = false;
-                if (!m_param->bHistBasedSceneCut || (m_param->bHistBasedSceneCut && frames[j + 1]->bScenecut))
-                    isNextScenecut = scenecut(frames, j, j + 1, false, origNumFrames);
-                if (isNextScenecut || (bForceRADL && frames[j]->frameNum == preRADL))
+                if (scenecut(frames, j, j + 1, false, origNumFrames) ||
+                    (bForceRADL && (frames[j]->frameNum == preRADL)))
                 {
                     frames[j]->sliceType = X265_TYPE_P;
                     numAnalyzed = j;
@@ -2318,9 +2595,10 @@ bool Lookahead::scenecut(Lowres **frames, int p0, int p1, bool bRealScenecut, in
         /* Where A and B are scenes: AAAAAABBBAAAAAA
          * If BBB is shorter than (maxp1-p0), it is detected as a flash
          * and not considered a scenecut. */
+
         for (int cp1 = p1; cp1 <= maxp1; cp1++)
         {
-            if (!scenecutInternal(frames, p0, cp1, false) && !m_param->bHistBasedSceneCut)
+            if (!scenecutInternal(frames, p0, cp1, false))
             {
                 /* Any frame in between p0 and cur_p1 cannot be a real scenecut. */
                 for (int i = cp1; i > p0; i--)
@@ -2329,7 +2607,7 @@ bool Lookahead::scenecut(Lowres **frames, int p0, int p1, bool bRealScenecut, in
                     noScenecuts = false;
                 }
             }
-            else if ((m_param->bHistBasedSceneCut && frames[cp1]->m_bIsMaxThres) || scenecutInternal(frames, cp1 - 1, cp1, false))
+            else if (scenecutInternal(frames, cp1 - 1, cp1, false))
             {
                 /* If current frame is a Scenecut from p0 frame as well as Scenecut from
                  * preceeding frame, mark it as a Scenecut */
@@ -2390,9 +2668,6 @@ bool Lookahead::scenecut(Lowres **frames, int p0, int p1, bool bRealScenecut, in
 
     if (!frames[p1]->bScenecut)
         return false;
-    /* Check only scene transitions if max threshold */
-    if (m_param->bHistBasedSceneCut && frames[p1]->m_bIsMaxThres)
-        return frames[p1]->bScenecut;
 
     return scenecutInternal(frames, p0, p1, bRealScenecut);
 }
@@ -2410,19 +2685,8 @@ bool Lookahead::scenecutInternal(Lowres **frames, int p0, int p1, bool bRealScen
     /* magic numbers pulled out of thin air */
     float threshMin = (float)(threshMax * 0.25);
     double bias = m_param->scenecutBias;
-    if (m_param->bHistBasedSceneCut)
-    {
-        double minT = TEMPORAL_SCENECUT_THRESHOLD * (1 + m_param->edgeTransitionThreshold);
-        if (frame->interPCostPercDiff > minT || frame->intraCostPercDiff > minT)
-        {
-            if (bRealScenecut && frame->bScenecut)
-                x265_log(m_param, X265_LOG_DEBUG, "scene cut at %d \n", frame->frameNum);
-            return frame->bScenecut;
-        }
-        else
-            return false;
-    }
-    else if (bRealScenecut)
+
+    if (bRealScenecut)
     {
         if (m_param->keyframeMin == m_param->keyframeMax)
             threshMin = threshMax;
@@ -2447,6 +2711,167 @@ bool Lookahead::scenecutInternal(Lowres **frames, int p0, int p1, bool bRealScen
                  frame->frameNum, icost, pcost, 1. - (double)pcost / icost, bias, gopSize, imb, pmb);
     }
     return res;
+}
+
+bool Lookahead::detectHistBasedSceneChange(Lowres **frames, int p0, int p1, int p2)
+{
+    bool isAbruptChange;
+    bool isSceneChange;
+
+    Lowres  *previousFrame = frames[p0];
+    Lowres  *currentFrame = frames[p1];
+    Lowres  *futureFrame = frames[p2];
+
+    currentFrame->bHistScenecutAnalyzed = true;
+
+    uint32_t **accHistDiffRunningAvgCb = m_accHistDiffRunningAvgCb;
+    uint32_t **accHistDiffRunningAvgCr = m_accHistDiffRunningAvgCr;
+    uint32_t **accHistDiffRunningAvg = m_accHistDiffRunningAvg;
+
+    uint8_t absIntDiffFuturePast = 0;
+    uint8_t absIntDiffFuturePresent = 0;
+    uint8_t absIntDiffPresentPast = 0;
+
+    uint32_t abruptChangeCount = 0;
+    uint32_t sceneChangeCount = 0;
+
+    uint32_t segmentWidth = frames[1]->widthFullRes / NUMBER_OF_SEGMENTS_IN_WIDTH;
+    uint32_t segmentHeight = frames[1]->heightFullRes / NUMBER_OF_SEGMENTS_IN_HEIGHT;
+
+    for (uint32_t segmentInFrameWidthIndex = 0; segmentInFrameWidthIndex < NUMBER_OF_SEGMENTS_IN_WIDTH; segmentInFrameWidthIndex++)
+    {
+        for (uint32_t segmentInFrameHeightIndex = 0; segmentInFrameHeightIndex < NUMBER_OF_SEGMENTS_IN_HEIGHT; segmentInFrameHeightIndex++)
+        {
+            isAbruptChange = false;
+            isSceneChange = false;
+
+            // accumulative absolute histogram differences between the past and current frame
+            uint32_t accHistDiff = 0;
+            uint32_t accHistDiffCb = 0;
+            uint32_t accHistDiffCr = 0;
+
+            uint32_t segmentWidthOffset = (segmentInFrameWidthIndex == NUMBER_OF_SEGMENTS_IN_WIDTH - 1) ?
+                frames[1]->widthFullRes - (NUMBER_OF_SEGMENTS_IN_WIDTH * segmentWidth) : 0;
+
+            uint32_t segmentHeightOffset = (segmentInFrameHeightIndex == NUMBER_OF_SEGMENTS_IN_HEIGHT - 1) ?
+                frames[1]->heightFullRes - (NUMBER_OF_SEGMENTS_IN_HEIGHT * segmentHeight) : 0;
+
+            segmentWidth += segmentWidthOffset;
+            segmentHeight += segmentHeightOffset;
+
+            uint32_t segmentThreshHold = (
+                ((X265_ABS((int64_t)currentFrame->picAvgVariance - (int64_t)previousFrame->picAvgVariance)) > PICTURE_DIFF_VARIANCE_TH) &&
+                (currentFrame->picAvgVariance > PICTURE_VARIANCE_TH || previousFrame->picAvgVariance > PICTURE_VARIANCE_TH)) ?
+                HIGH_VAR_SCENE_CHANGE_TH * NUM64x64INPIC(segmentWidth, segmentHeight) : LOW_VAR_SCENE_CHANGE_TH * NUM64x64INPIC(segmentWidth, segmentHeight);
+
+            uint32_t segmentThreshHoldCb = (
+                ((X265_ABS((int64_t)currentFrame->picAvgVarianceCb - (int64_t)previousFrame->picAvgVarianceCb)) > PICTURE_DIFF_VARIANCE_CHROMA_TH) &&
+                (currentFrame->picAvgVarianceCb > PICTURE_VARIANCE_CHROMA_TH || previousFrame->picAvgVarianceCb > PICTURE_VARIANCE_CHROMA_TH)) ?
+                HIGH_VAR_SCENE_CHANGE_CHROMA_TH * NUM64x64INPIC(segmentWidth, segmentHeight) : LOW_VAR_SCENE_CHANGE_CHROMA_TH * NUM64x64INPIC(segmentWidth, segmentHeight);
+
+            uint32_t segmentThreshHoldCr = (
+                ((X265_ABS((int64_t)currentFrame->picAvgVarianceCr - (int64_t)previousFrame->picAvgVarianceCr)) > PICTURE_DIFF_VARIANCE_CHROMA_TH) &&
+                (currentFrame->picAvgVarianceCr > PICTURE_VARIANCE_CHROMA_TH || previousFrame->picAvgVarianceCr > PICTURE_VARIANCE_CHROMA_TH)) ?
+                HIGH_VAR_SCENE_CHANGE_CHROMA_TH * NUM64x64INPIC(segmentWidth, segmentHeight) : LOW_VAR_SCENE_CHANGE_CHROMA_TH * NUM64x64INPIC(segmentWidth, segmentHeight);
+
+            for (uint32_t bin = 0; bin < HISTOGRAM_NUMBER_OF_BINS; ++bin) {
+                accHistDiff += X265_ABS((int32_t)currentFrame->picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0][bin] - (int32_t)previousFrame->picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0][bin]);
+                accHistDiffCb += X265_ABS((int32_t)currentFrame->picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1][bin] - (int32_t)previousFrame->picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][1][bin]);
+                accHistDiffCr += X265_ABS((int32_t)currentFrame->picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2][bin] - (int32_t)previousFrame->picHistogram[segmentInFrameWidthIndex][segmentInFrameHeightIndex][2][bin]);
+            }
+
+            if (m_resetRunningAvg) {
+                accHistDiffRunningAvg[segmentInFrameWidthIndex][segmentInFrameHeightIndex] = accHistDiff;
+                accHistDiffRunningAvgCb[segmentInFrameWidthIndex][segmentInFrameHeightIndex] = accHistDiffCb;
+                accHistDiffRunningAvgCr[segmentInFrameWidthIndex][segmentInFrameHeightIndex] = accHistDiffCr;
+            }
+
+            // difference between accumulative absolute histogram differences and the running average at the current frame.
+            uint32_t accHistDiffError = X265_ABS((int32_t)accHistDiffRunningAvg[segmentInFrameWidthIndex][segmentInFrameHeightIndex] - (int32_t)accHistDiff);
+            uint32_t accHistDiffErrorCb = X265_ABS((int32_t)accHistDiffRunningAvgCb[segmentInFrameWidthIndex][segmentInFrameHeightIndex] - (int32_t)accHistDiffCb);
+            uint32_t accHistDiffErrorCr = X265_ABS((int32_t)accHistDiffRunningAvgCr[segmentInFrameWidthIndex][segmentInFrameHeightIndex] - (int32_t)accHistDiffCr);
+
+            if ((accHistDiffError > segmentThreshHold     && accHistDiff >= accHistDiffError) ||
+                (accHistDiffErrorCb > segmentThreshHoldCb && accHistDiffCb >= accHistDiffErrorCb) ||
+                (accHistDiffErrorCr > segmentThreshHoldCr && accHistDiffCr >= accHistDiffErrorCr)) {
+
+                isAbruptChange = true;
+            }
+
+            if (isAbruptChange)
+            {
+                absIntDiffFuturePast = (uint8_t)X265_ABS((int16_t)futureFrame->averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0] - (int16_t)previousFrame->averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0]);
+                absIntDiffFuturePresent = (uint8_t)X265_ABS((int16_t)futureFrame->averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0] - (int16_t)currentFrame->averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0]);
+                absIntDiffPresentPast = (uint8_t)X265_ABS((int16_t)currentFrame->averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0] - (int16_t)previousFrame->averageIntensityPerSegment[segmentInFrameWidthIndex][segmentInFrameHeightIndex][0]);
+
+                if (absIntDiffFuturePresent >= FLASH_TH * absIntDiffFuturePast && absIntDiffPresentPast >= FLASH_TH * absIntDiffFuturePast) {
+                    x265_log(m_param, X265_LOG_DEBUG, "Flash in frame# %i , %i, %i, %i\n", currentFrame->frameNum, absIntDiffFuturePast, absIntDiffFuturePresent, absIntDiffPresentPast);
+                }
+                else if (absIntDiffFuturePresent < FADE_TH && absIntDiffPresentPast < FADE_TH) {
+                    x265_log(m_param, X265_LOG_DEBUG, "Fade in frame# %i , %i, %i, %i\n", currentFrame->frameNum, absIntDiffFuturePast, absIntDiffFuturePresent, absIntDiffPresentPast);
+                }
+                else if (X265_ABS(absIntDiffFuturePresent - absIntDiffPresentPast) < INTENSITY_CHANGE_TH && absIntDiffFuturePresent + absIntDiffPresentPast >= absIntDiffFuturePast) {
+                    x265_log(m_param, X265_LOG_DEBUG, "Intensity Change in frame# %i , %i, %i, %i\n", currentFrame->frameNum, absIntDiffFuturePast, absIntDiffFuturePresent, absIntDiffPresentPast);
+                }
+                else {
+                    isSceneChange = true;
+                    x265_log(m_param, X265_LOG_DEBUG, "Scene change in frame# %i , %i, %i, %i\n", currentFrame->frameNum, absIntDiffFuturePast, absIntDiffFuturePresent, absIntDiffPresentPast);
+                }
+
+            }
+            else {
+                accHistDiffRunningAvg[segmentInFrameWidthIndex][segmentInFrameHeightIndex] = (3 * accHistDiffRunningAvg[segmentInFrameWidthIndex][segmentInFrameHeightIndex] + accHistDiff) / 4;
+            }
+
+            abruptChangeCount += isAbruptChange;
+            sceneChangeCount += isSceneChange;
+        }
+    }
+
+    if (abruptChangeCount >= m_segmentCountThreshold) {
+        m_resetRunningAvg = true;
+    }
+    else {
+        m_resetRunningAvg = false;
+    }
+
+    if ((sceneChangeCount >= m_segmentCountThreshold)) {
+        x265_log(m_param, X265_LOG_DEBUG, "Scene Change in Pic Number# %i\n", currentFrame->frameNum);
+
+        return true;
+    }
+    else {
+        return false;
+    }
+
+}
+
+bool Lookahead::histBasedScenecut(Lowres **frames, int p0, int p1, int numFrames)
+{
+    /* Only do analysis during a normal scenecut check. */
+    if (m_param->bframes)
+    {
+        int origmaxp1 = p0 + 1;
+        /* Look ahead to avoid coding short flashes as scenecuts. */
+        origmaxp1 += m_param->bframes;
+        int maxp1 = X265_MIN(origmaxp1, numFrames);
+
+        for (int cp1 = p0; cp1 < maxp1; cp1++)
+        {
+            if (frames[cp1 + 1]->bHistScenecutAnalyzed == true)
+                continue;
+
+            if (detectHistBasedSceneChange(frames, cp1, cp1 + 1, cp1 + 2))
+            {
+                /* If current frame is a Scenecut from p0 frame as well as Scenecut from
+                 * preceeding frame, mark it as a Scenecut */
+                frames[cp1+1]->bScenecut = true;
+            }
+        }
+
+    }
+
+    return frames[p1]->bScenecut;
 }
 
 void Lookahead::slicetypePath(Lowres **frames, int length, char(*best_paths)[X265_LOOKAHEAD_MAX + 1])
@@ -2479,7 +2904,7 @@ void Lookahead::slicetypePath(Lowres **frames, int length, char(*best_paths)[X26
 }
 
 // Find slicetype of the frame with poc # in lookahead buffer
-int Lookahead::FindSliceType(int poc)
+int Lookahead::findSliceType(int poc)
 {
     int out_slicetype = X265_TYPE_AUTO;
     if (m_filled)

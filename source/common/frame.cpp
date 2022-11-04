@@ -181,8 +181,6 @@ fail:
 bool Frame::createSubSample()
 {
 
-    //m_param = param;
-
     m_fencPicSubsampled2 = new PicYuv;
     m_fencPicSubsampled4 = new PicYuv;
 
@@ -332,7 +330,8 @@ void Frame::destroy()
         X265_FREE(m_addOnPrevChange);
         m_addOnPrevChange = NULL;
     }
-    m_lowres.destroy();
+
+    m_lowres.destroy(m_param);
     X265_FREE(m_rcData);
 
     if (m_param->bDynamicRefine)
